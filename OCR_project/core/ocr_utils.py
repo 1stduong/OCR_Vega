@@ -1,66 +1,156 @@
 from libs.libs import *
-from core.metrics import monitor_resources, calculate_metrics
+#from core.metrics import monitor_resources, calculate_metrics_with_results
 from config.config import *
-from core.shared_utils import *
-from engines.ocr_engine import apply_ocr
+#from engines.ocr_engine import apply_ocr
 
-# Generalized OCR Application
-def crop_text_regions(image, coords):
-    """Crop text regions using bounding box coordinates."""
-    h_img, w_img, _ = image.shape
-    pts = np.array(coords, dtype=np.int32).reshape((4, 2))
-    rect = cv2.boundingRect(pts)
-    x, y, w, h = rect
-
-    # Clamp coordinates to fit within the image
-    x = max(0, x)
-    y = max(0, y)
-    w = min(w, w_img - x)
-    h = min(h, h_img - y)
-
-    # Validate crop dimensions
-    if w <= 0 or h <= 0:
-        print(f"Invalid crop dimensions: x={x}, y={y}, w={w}, h={h}")
-        return None
-
-    cropped = image[y:y+h, x:x+w]
-    return cropped
-
-@monitor_resources
-def process_pipeline(framework, image_folder, label_folder, num_files, apply_ocr_fn, use_cropped=False, iou_threshold=0.3):
+def parse_label_files(label_folder, num_files):
     """
-    Generalized pipeline to run OCR and calculate metrics.
+    Function;
+        Parses a label file to extract bounding boxes and corresponding labels.
+        
+    Args:
+        label_file (str): Path to the label file.
+        
+    Returns:
+        annotations (dict): A dictionary where keys are image filenames and values are lists of bounding boxes and labels.
+    Example: gt_1.txt -> im0001.jpg
+    """
+    
+    if not os.path.exists(label_folder):
+        raise FileNotFoundError(f"Folder not found: {label_folder}")
+    
+    annotations = {}
+    label_files = natsorted(os.listdir(label_folder))[:num_files]  # limit by num_files
+
+    #Skip not related format files
+    for label_file in label_files:
+        if not label_file.startswith("gt_") or not label_file.endswith(".txt"):
+            print(f"Skipping unrelated file: {label_file}")
+            continue
+        
+        #Extract numeric part and map to image filename
+        try:
+            file_index = int(label_file.split('_')[1].split('.')[0]) # Extract number from gt_1.txt
+            image_file = f"im{file_index:04d}.jpg"  # Format as im0001.jpg
+        except ValueError as e:
+            print(f"Invalid label file name format: {label_file}. Error: {e}")
+            continue
+        
+        #Parse label file
+        file_path = os.path.join(label_folder, label_file)
+        with open(file_path, 'r', encoding='utf-8') as file:
+            annotation = []
+            for line_num, line in enumerate(file, start=1):
+                data = line.strip().split(',')
+                if len(data) < 9:
+                    print(f"Skipping invalid line in {label_file}: {line}")
+                    continue
+                try:
+                    coords = list(map(int, data[:8]))  # First 8 values are bounding box coords
+                    text = data[8]  # 9th value is the text
+                    annotation.append((coords, text))
+                except ValueError as e:
+                    print(f"Error parsing line {line_num} in {label_file}: {e}")
+        if annotation:
+            annotations[image_file] = annotation
+        else:
+            print(f"No valid annotations found in {label_file}")
+            
+    #print(f"Parsed annotations: {annotations.keys()}")
+    return annotations
+
+def preprocess_image(image, preprocess_type="original"):
+    """
+    Preprocess the image for OCR.
 
     Args:
-        framework (str): Name of the OCR framework (e.g., 'easyocr', 'paddleocr', 'tesseract').
-        image_folder (str): Path to images.
-        label_folder (str): Path to labels.
-        num_files (int): Number of files to process.
-        apply_ocr_fn (callable): OCR function specific to the framework.
-        use_cropped (bool): Whether to use cropped regions or full images.
-        iou_threshold (float): IoU threshold for bounding box metrics.
+        image (numpy.ndarray): The input image to preprocess.
+        preprocess_type (str): The type of preprocessing. Options are "original" or "cropped".
+
+    Returns:
+        numpy.ndarray: The preprocessed image.
     """
-    print(f"Running pipeline for {framework}...")
+    if preprocess_type == "original":
+        # Preprocessing for original images (full image)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        denoised = cv2.medianBlur(thresh, 3)  # Remove noise
+        return denoised
+    elif preprocess_type == "cropped":
+        # Preprocessing for cropped images (focused text regions)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        resized = cv2.resize(gray, (128, 32), interpolation=cv2.INTER_AREA)  # Normalize size
+        normalized = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
+        return normalized
+    else:
+        raise ValueError(f"Unknown preprocess_type: {preprocess_type}")
 
-    # Step 1: Apply OCR
-    print(f"Step 1: Applying {framework} OCR...")
-    ocr_results = apply_ocr_fn(image_folder, label_folder, num_files, use_cropped)
-    if ocr_results is None:
-        print("OCR results are empty. Skipping metric calculations.")
-        return
+def crop_images_from_folder(preprocess=True, output_folder=None):
+    """
+    Splits an image into multiple cropped images based on bounding boxes in the label file
+    and preprocesses the cropped images if required.
 
-    print(f"OCR results for {framework}: {ocr_results}")
+    Args:
+        preprocess (bool): Whether to preprocess cropped images.
+        output_folder (str): Optional path to save the cropped and processed images.
 
-    # Step 2: Calculate Metrics
-    print("Step 2: Calculating Metrics...")
-    metrics = calculate_metrics(
-        image_folder=image_folder,
-        label_folder=label_folder,
-        num_files=num_files,
-        use_cropped=use_cropped,
-        iou_threshold=iou_threshold,
-        framework=framework  # Explicit keyword argument
-    )
-    print(f"Metrics for {framework}: {metrics}")
+    Returns:
+        dict: A dictionary where keys are image filenames and values are lists of processed cropped images with labels.
+    """
+    cropped_data = {}
+    total_crops = 0
+    total_labels = 0
 
-    return metrics
+    annotations = parse_label_files(label_folder, num_files)
+    #print(f"Parsed annotations: {annotations.keys()}")
+
+    for image_file, bbox_labels in annotations.items():
+        image_path = os.path.join(image_folder, image_file)
+        if not os.path.exists(image_path):
+            print(f"Image file not found: {image_file}")
+            continue
+
+        image = cv2.imread(image_path)
+        if image is None:
+            print(f"Failed to load image: {image_path}")
+            continue
+
+        image_crops = []
+
+        for idx, (bbox, label) in enumerate(bbox_labels):
+            pts = np.array(bbox, dtype=np.int32).reshape((4, 2))
+            rect = cv2.boundingRect(pts)
+            x, y, w, h = rect
+            x = max(0, x)
+            y = max(0, y)
+            w = min(w, image.shape[1] - x)
+            h = min(h, image.shape[0] - y)
+
+            cropped = image[y:y+h, x:x+w]
+            if cropped.size == 0:
+                print(f"Skipping empty crop for bounding box {idx} in {image_file}")
+                continue
+
+            # Preprocess the cropped image if preprocess is enabled
+            if preprocess:
+                cropped = preprocess_image(cropped, preprocess_type="cropped")
+
+            image_crops.append((cropped, label))
+            total_crops += 1
+
+            if output_folder:
+                if not os.path.exists(output_folder):
+                    os.makedirs(output_folder)
+                label_safe = label.replace(" ", "_").replace("/", "_")
+                output_path = os.path.join(output_folder, f"{image_file.split('.')[0]}_{idx}_{label_safe}.jpg")
+                cv2.imwrite(output_path, cropped)
+
+        cropped_data[image_file] = image_crops
+        total_labels += len(bbox_labels)
+        print(f"Processed {len(image_crops)} crops for {image_file}")
+
+    print("\nSummary:")
+    print(f"Total cropped images: {total_crops}")
+    print(f"Total labels processed: {total_labels}")
+
+    return cropped_data

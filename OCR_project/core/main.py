@@ -1,53 +1,95 @@
-from engines.easy_ocr import apply_easy_ocr
-from engines.paddle_ocr import apply_paddle_ocr
-from engines.tesseract_ocr import apply_tesseract_ocr
-from config.config import image_folder, label_folder, num_files
-from core.ocr_utils import process_pipeline
+from core.ocr_utils import *
+from config.config import *
+from engines.easy_ocr import easy_ocr
+from engines.tesseract_ocr import tesseract_ocr
+from core.metrics import calculate_metrics
 
 def main():
-    # Ask user for the OCR framework
-    framework = input("Enter framework (easy_ocr/paddle_ocr/tesseract_ocr): ").strip().lower()
-
-    # Map framework to appropriate function
-    if framework == "easy_ocr":
-        apply_ocr_fn = apply_easy_ocr
-    elif framework == "paddle_ocr":
-        apply_ocr_fn = apply_paddle_ocr
-    elif framework == "tesseract_ocr":
-        apply_ocr_fn = apply_tesseract_ocr
-    else:
-        print(f"Unknown framework: {framework}")
+    mode = input("Select mode (original/cropped): ").strip().lower()
+    if mode not in {"original", "cropped"}:
+        print("Invalid choice. Please select 'original' or 'cropped'.")
         return
 
-    # Ask user if they want to apply cropped text regions
-    cropped_choice = input("Apply cropped regions? (y/n): ").strip().lower()
-    if cropped_choice == 'y':
-        use_cropped = True
-        mode = "normal"  # Automatically set to normal for cropped
-    else:
-        use_cropped = False
-        # Ask user for 'mode': normal or test
-        mode = input("Enter mode (normal/test): ").strip().lower()
+    framework = input("Select OCR framework (easyocr/tesseract): ").strip().lower()
+    if framework not in {"easyocr", "tesseract"}:
+        print("Invalid choice. Please select 'easyocr' or 'tesseract'.")
+        return
 
-    # Define a wrapper to pass mode to the OCR function
-    def apply_ocr_wrapper(img_folder, lbl_folder, n_files, use_crop):
-        return apply_ocr_fn(
-            image_folder=img_folder,
-            label_folder=lbl_folder,
-            num_files=n_files,
-            use_cropped=use_crop,
-            mode=mode  # Pass mode explicitly
-        )
+    save_choice = input("Do you want to save images? (yes/no): ").strip().lower()
+    if save_choice not in {"yes", "no"}:
+        print("Invalid choice. Defaulting to no.")
+        save_choice = "no"
 
-    # Run the pipeline
-    process_pipeline(
-        framework=framework,
-        image_folder=image_folder,
-        label_folder=label_folder,
-        num_files=num_files,
-        apply_ocr_fn=apply_ocr_wrapper,
-        use_cropped=use_cropped
-    )
+    # Set save path based on user choice
+    output_folder = output_folder_original if mode == "original" else output_folder_cropped
+    save_path = output_folder if save_choice == "yes" else None
+
+    ground_truths = []
+    predictions = []
+
+    if mode == "original":
+        annotations = parse_label_files(label_folder, num_files)
+        for image_file, bbox_labels in annotations.items():
+            image_path = os.path.join(image_folder, image_file)
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"Failed to load image: {image_file}")
+                continue
+
+            # Preprocess the image
+            processed_image = preprocess_image(image, preprocess_type="original")
+
+            # Determine the save path for this image
+            image_save_path = (
+                os.path.join(save_path, f"predicted_{image_file}")
+                if save_path
+                else None
+            )
+
+            # Apply OCR
+            ocr_function = easy_ocr if framework == "easyocr" else tesseract_ocr
+            ocr_results = ocr_function(
+                processed_image,
+                labels=bbox_labels,
+                mode="original",
+                draw_boxes=True if save_choice == "yes" else False,
+                save_path=image_save_path
+            )
+            ground_truths.append(ocr_results["ground_truth"])
+            predictions.append(ocr_results["predicted_text"])
+
+    elif mode == "cropped":
+        cropped_data = crop_images_from_folder(preprocess=True)
+        for image_file, crops in cropped_data.items():
+            for idx, (processed_crop, label) in enumerate(crops):
+                # Determine the save path for cropped images
+                sub_image_save_path = (
+                    os.path.join(save_path, f"{os.path.splitext(image_file)[0]}_crop_{idx}.jpg")
+                    if save_path
+                    else None
+                )
+
+                # Apply OCR to cropped region
+                ocr_function = easy_ocr if framework == "easyocr" else tesseract_ocr
+                ocr_results = ocr_function(
+                    processed_crop,
+                    labels=label,
+                    mode="cropped",
+                    save_path=sub_image_save_path
+                )
+                ground_truths.append(ocr_results["ground_truth"])
+                predictions.append(ocr_results["predicted_text"])
+
+                # Save cropped images if save_path is valid
+                if sub_image_save_path:
+                    cv2.imwrite(sub_image_save_path, processed_crop)
+                    print(f"Saved cropped image to {sub_image_save_path}")
+
+    # Calculate and display metrics
+    metrics = calculate_metrics(ground_truths, predictions)
+    print("\nMetrics:")
+    for metric, value in metrics.items():
+        print(f"  {metric}: {value:.2f}%")
 
 if __name__ == "__main__":
     main()

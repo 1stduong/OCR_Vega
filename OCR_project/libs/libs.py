@@ -8,3 +8,6 @@ import time
 import psutil
 import pandas as pd
 from math import sqrt
+import pytesseract
+from pytesseract import Output
+from difflib import SequenceMatcher
